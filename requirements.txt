@@ -1,0 +1,8 @@
+pyTelegramBotAPI
+requests
+Flask
+gunicorn
+PyMySQL
+openpyxl
+pytz
+telethon
