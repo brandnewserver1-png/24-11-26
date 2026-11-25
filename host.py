@@ -8215,6 +8215,8 @@ def receive_sms():
             logging.warning(f"SMS webhook unauthorized: {flask_request.remote_addr}")
             return {"status": "unauthorized"}, 403
 
+        _maybe_cleanup_old_sms()  # দিনে একবার, background এ
+
         # Rate limiting
         now_ts = _time_module.time()
         _sms_request_times[:] = [t for t in _sms_request_times if now_ts - t < 60]
@@ -12926,6 +12928,28 @@ def _cleanup_old_sms_pending():
         logging.info(f"SMS cleanup: {len(to_delete)} পুরনো entry মুছে ফেলা হয়েছে।")
 
 
+# 🧹 SMS cleanup দিনে একবার — আলাদা থ্রেড নেই। SMS আসার সময় (বা বট চালু হওয়ার সময়) শেষ
+# cleanup ২৪ ঘণ্টার বেশি আগে হয়ে থাকলে ব্যাকগ্রাউন্ড পুল দিয়ে একবার চালানো হয়।
+_sms_cleanup_last = 0.0
+_sms_cleanup_lock = threading.Lock()
+
+def _maybe_cleanup_old_sms():
+    global _sms_cleanup_last
+    now_ts = _time_module.time()
+    with _sms_cleanup_lock:
+        if now_ts - _sms_cleanup_last < 86400:
+            return
+        _sms_cleanup_last = now_ts
+    def _run():
+        try:
+            _cleanup_old_sms_pending()
+        except Exception as e:
+            logging.error(f"SMS cleanup error: {e}")
+    try:
+        _EXECUTOR.submit(_run)
+    except Exception:
+        pass
+
 # process_sms — নিচে line 7052 এ final unified version আছে
 
 
@@ -13574,7 +13598,7 @@ def get_user_lang(user_id, db=None):
 _DB_DEFAULT = {
     "users": {},
     "products": {
-        "Instagram": 10
+        "Fr outlook": 10
     },
     "product_details": {},
     "flash_sales": {},
@@ -36865,6 +36889,15 @@ def admin_product_discount_step3(message, target_user, product_name):
     except: pass
 
 
+EDIT_BAL_USER_BTN = "👤 User"
+
+def _edit_balance_kb(admin_id):
+    """Cancel বাটনের পাশে '👤 User' বাটন — চাপলে ইউজারের ID (ক্লিকযোগ্য) বটে চলে আসে।"""
+    lang = get_user_lang(admin_id)
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.row(KbBtn(LANG[lang]["cancel"], role="cancel"), types.KeyboardButton(EDIT_BAL_USER_BTN))
+    return markup
+
 def admin_edit_balance_step1(message):
     user_id = str(message.chat.id)
     db = load_db()
@@ -36881,7 +36914,7 @@ def admin_edit_balance_step1(message):
         f"• <code>500</code> → Set 500 BDT\n"
         f"• <code>+100</code> → Add 100 BDT\n"
         f"• <code>-50</code> → Deduct 50 BDT",
-        parse_mode="HTML", reply_markup=get_cancel_button(user_id))
+        parse_mode="HTML", reply_markup=_edit_balance_kb(user_id))
     bot.register_next_step_handler(msg, lambda m: admin_edit_balance_step2(m, target_user))
 
 def admin_edit_balance_step2(message, target_user):
@@ -36889,6 +36922,14 @@ def admin_edit_balance_step2(message, target_user):
     db = load_db()
     if message.text == "❌ Cancel":
         show_admin_panel(user_id); return
+    if (message.text or "").strip() == EDIT_BAL_USER_BTN:
+        # 👤 User বাটন: ইউজারের ID পাঠাও (ক্লিক করলে প্রোফাইল খোলে, <code> এ চেপে কপি করা যায়), তারপর আবার amount চাও
+        bot.send_message(user_id,
+            f"👤 <b>User:</b> <a href=\"tg://user?id={target_user}\">{target_user}</a>\n"
+            f"🆔 <code>{target_user}</code>",
+            parse_mode="HTML", reply_markup=_edit_balance_kb(user_id))
+        bot.register_next_step_handler(message, lambda m: admin_edit_balance_step2(m, target_user))
+        return
     value = message.text.strip()
     current_balance = float(db["users"][target_user].get("balance", 0))
     try:
@@ -37743,6 +37784,37 @@ def end_flash_sale(db, product_name):
             db["products"][product_name] = original_price
         db["flash_sales"].pop(product_name, None)
 
+# ⏱️ Flash sale শেষ হওয়ার জন্য আলাদা সবসময়-চলা থ্রেড নেই — sale শুরু হলে শুধু সেই sale এর
+# জন্য একটা Timer থ্রেড চলে, sale শেষ হলেই সেটা মরে যায়। কোনো sale না থাকলে কোনো থ্রেড নেই।
+_flash_timers = {}
+_flash_timers_lock = threading.Lock()
+
+def _schedule_flash_expiry(product_name, end_time):
+    """এই product এর flash sale শেষ হওয়ার মুহূর্তে check_and_expire_flash_sales চালাবে।"""
+    delay = max(0.0, float(end_time) - _time_module.time()) + 1.0
+    with _flash_timers_lock:
+        old = _flash_timers.pop(product_name, None)
+        if old:
+            old.cancel()
+        def _fire(pn=product_name):
+            with _flash_timers_lock:
+                _flash_timers.pop(pn, None)
+            check_and_expire_flash_sales()
+        t = threading.Timer(delay, _fire)
+        t.daemon = True
+        t.name = f"flash_expiry_{product_name}"
+        _flash_timers[product_name] = t
+        t.start()
+
+def restore_flash_expiry_timers():
+    """বট রিস্টার্ট হলে চলমান flash sale গুলোর জন্য Timer আবার বসায় (expired হলে সাথে সাথে restore)।"""
+    try:
+        db = load_db()
+        for pn, fl in list((db.get("flash_sales") or {}).items()):
+            _schedule_flash_expiry(pn, (fl or {}).get("end_time", 0))
+    except Exception as e:
+        logging.error(f"restore_flash_expiry_timers error: {e}")
+
 def check_and_expire_flash_sales():
     """Background এ expired flash sales restore করো।"""
     try:
@@ -37848,12 +37920,11 @@ def _refresh_flash_worker_impl(call):
         bot.send_message(user_id, updated_text, parse_mode="HTML", reply_markup=inline_markup)
 
 def flash_sale_background_worker():
-    """Background thread যা প্রতি মিনিটে flash sale check ও low stock alert করে।"""
+    """Background thread যা প্রতি মিনিটে low stock alert করে।
+    (Flash sale expiry আর এখানে নেই — সেটা প্রতি sale এর নিজস্ব Timer দিয়ে হয়।)"""
     _low_stock_alerted = set()  # একবার alert দেওয়া products track করো
-    _last_sms_cleanup = 0
     while True:
         _time_module.sleep(60)
-        check_and_expire_flash_sales()
         # Low stock check — শুধু "Stock Alert" admin panel থেকে চালু থাকলেই চলবে
         try:
             db = load_db()
@@ -37877,14 +37948,6 @@ def flash_sale_background_worker():
                         _low_stock_alerted.discard(product)  # stock ঠিক হলে reset
         except Exception as e:
             logging.error(f"Low stock check error: {e}")
-
-        # ── ৩০ দিনের পুরনো SMS cleanup (প্রতি ঘণ্টায় একবার) ──
-        try:
-            if _time_module.time() - _last_sms_cleanup >= 3600:
-                _last_sms_cleanup = _time_module.time()
-                _cleanup_old_sms_pending()
-        except Exception as e:
-            logging.error(f"SMS cleanup error: {e}")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -38161,6 +38224,7 @@ def admin_set_flash_sale_step3(message, product_name, discount):
     set_flash_sale(db, product_name, discount, duration)
     # ⚡ Targeted write — flash_sales only
     update_db_path("/flash_sales", db.get("flash_sales", {}))
+    _schedule_flash_expiry(product_name, db["flash_sales"][product_name].get("end_time", 0))
 
     original_price = db["flash_sales"][product_name].get("original_price", 0)
     discounted_price = db["flash_sales"][product_name].get("discounted_price", 0)
@@ -40446,13 +40510,13 @@ def process_proxychk_9proxy_input(message):
             f"👤 <b>Username:</b> <code>{base_username}</code>\n\n"
             "❌ <b>Not Found</b>\n"
             "<i>No account found with this username. Please double-check and try again.</i>",
-            parse_mode="HTML", reply_markup=get_other_menu(user_id))
+            parse_mode="HTML", reply_markup=get_main_menu(user_id))
         return
 
     if err:
         bot.send_message(user_id,
             "❌ <b>Failed to check usage!</b>\n\n<i>Please try again later.</i>",
-            parse_mode="HTML", reply_markup=get_other_menu(user_id))
+            parse_mode="HTML", reply_markup=get_main_menu(user_id))
         try:
             if not is_admin(user_id):
                 bot.send_message(ADMIN_ID, f"🔍 <b>9Proxy Usage Check Error</b>\n👤 <code>{user_id}</code>\n<i>{_hx(str(err)[:200])}</i>", parse_mode="HTML")
@@ -40489,7 +40553,7 @@ def process_proxychk_9proxy_input(message):
         reply += f"\n🌐 <b>IP Used:</b> <code>{ip_used}</code>"
 
     bot.send_message(user_id, reply.strip(), parse_mode="HTML",
-        reply_markup=get_other_menu(user_id))
+        reply_markup=get_main_menu(user_id))
 
 
 # ═══════════════════════════════════════════════════════════
@@ -40689,7 +40753,7 @@ def process_proxychk_h143_input(message):
 
     if info:
         bot.send_message(user_id, _h143_render_usage(username, info),
-            parse_mode="HTML", reply_markup=get_other_menu(user_id))
+            parse_mode="HTML", reply_markup=get_main_menu(user_id))
         return
 
     if err == "not_found":
@@ -40699,7 +40763,7 @@ def process_proxychk_h143_input(message):
             f"👤 <b>Username:</b> <code>{username}</code>\n\n"
             "❌ <b>Not Found</b>\n"
             "<i>No account found with this username. Please double-check and try again.</i>",
-            parse_mode="HTML", reply_markup=get_other_menu(user_id))
+            parse_mode="HTML", reply_markup=get_main_menu(user_id))
         return
 
     # API থেকে পড়া গেলো না → আগের মতো Mini Web App বাটন (fallback)
@@ -41876,9 +41940,12 @@ if __name__ == "__main__":
     print("✅ Cache Warmer worker started (idle এর পরেও instant response)")
 
     # Flash Sale background worker
+    # Flash sale expiry: সবসময়-চলা থ্রেড নেই, চলমান sale থাকলে শুধু তার Timer বসে
+    restore_flash_expiry_timers()
+    _maybe_cleanup_old_sms()   # বট চালু হলে একবার; এরপর দিনে একবার SMS আসার সময়
     flash_thread = threading.Thread(target=flash_sale_background_worker, daemon=True)
     flash_thread.start()
-    print("✅ Flash Sale background worker started")
+    print("✅ Flash Sale expiry: per-sale Timer | SMS cleanup: দিনে একবার (lazy) | low stock worker চালু")
 
     # 📊 Daily Sales Report worker — প্রতিদিন রাত 11:59 PM এ log channel এ পাঠাবে
     daily_report_thread = threading.Thread(target=daily_sales_report_worker, daemon=True)
