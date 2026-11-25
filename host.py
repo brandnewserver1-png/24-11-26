@@ -8424,6 +8424,14 @@ def start_sms_server():
 
     PORT = int(os.environ.get("PORT", 5000))
 
+    # ── ⚠️ Gunicorn fork করলে মূল প্রসেসের সব থ্রেড (telebot worker pool, backup, flash sale ইত্যাদি)
+    #    child worker এ থাকে না → webhook 200 দেয় অথচ বট কোনো উত্তর দেয় না।
+    #    তাই ডিফল্টে একই প্রসেসে threaded server চলবে। Gunicorn চাইলে USE_GUNICORN=1 দিন।
+    if os.environ.get("USE_GUNICORN", "").strip() not in ("1", "true", "True", "yes"):
+        print(f"🚀 Threaded Flask server (same process) on port {PORT}")
+        sms_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False, threaded=True)
+        return
+
     # ── Gunicorn দিয়ে চালানোর চেষ্টা (production-grade WSGI) ──
     try:
         import gunicorn.app.base
